@@ -1,0 +1,1207 @@
+---
+title: "Employee Attrition"
+author: "Blue"
+date: "2022-11-22"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+### Install Packages
+```{r packages, include=FALSE}
+### Needed Packages
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(class)
+library(caret)
+library(e1071)
+library(rmarkdown)
+library(readxl)
+library(imbalance)
+library(fastDummies)
+library(readr)
+library(aws.s3)
+library(datasets)
+library(scales)
+library(data.table)
+library(skimr) # Very useful library to help with analysis
+library(leaps) # Used for finding the best variables
+library(olsrr)
+```
+
+### Read in data from S3 Bucket
+```{r read data, include=FALSE}
+Sys.setenv("AWS_ACCESS_KEY_ID" = "AKIAVW4VHW4VPB7MHZWA",
+           "AWS_SECRET_ACCESS_KEY" = "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",
+           "AWS_DEFAULT_REGION" = "us-east-2")
+
+aws.s3::bucketlist()
+aws.s3::get_bucket("smuddsproject2")
+
+# Full Training Set
+initial_salary = s3read_using(FUN = read.csv,
+                    bucket = "smuddsproject2",
+                    object = "CaseStudy2-data.csv")
+# First Competition Test Set with No Attrition Values
+no_attrition = s3read_using(FUN = read.csv,
+                    bucket = "smuddsproject2",
+                    object = "CaseStudy2CompSet No Attrition.csv")
+# Second Competition Test Set with No Salary Values
+no_salary = s3read_using(FUN = read_xlsx,
+                    bucket = "smuddsproject2",
+                    object = "CaseStudy2CompSet No Salary.xlsx")
+
+```
+
+```{r view data, echo=FALSE}
+head(initial_salary)
+View(initial_salary) # Looks like we have 870 observations with 36 total columns
+skim(initial_salary) # Looking through the n_missing, we show that we don't have any missing values!
+sal_clean <- initial_salary # Re-Assign the initial data set
+
+```
+We can see that we have 870 observations with 36 columns, 9 of which are Character variables and 27 Numeric variables.  We can also see a few columns that have no variation, thus will not have any value in our analysis.  These columns are Over18 (all Y), EmployeeCount (all 1), and StandardHours (all 80).  We will remove these three columns for now. We can also remove ID and EmployeeNumber as they are just unique identifiers and are not quantitative variables. 
+
+
+### Removing Unessessary Columns
+```{r clean up, echo=FALSE}
+sal_clean <- sal_clean %>% select(-c("Over18", "EmployeeCount", "StandardHours", "ID", "EmployeeNumber"))
+
+skim(sal_clean)
+```
+
+My next step in data clean-up is to convert the character variables into factors. 
+
+### Process the data
+
+``` {r}
+factor_cols <- c("Attrition","BusinessTravel","Department","EducationField","Gender","JobRole","MaritalStatus", "OverTime")
+sal_clean[,factor_cols] <- lapply(sal_clean[,factor_cols], as.factor)
+
+skim(sal_clean)
+
+```
+
+Now we have a new dataset called "sal_data" that has 8 factors and 23 numeric variables that we can use for our KNN, NB, and LM analysis later on. 
+
+## EDA - Deep analysis on Attrition and Monthly Income vs each variable
+
+My first step in going into my EDA is to create an EDA dataset that I can use for visual analysis.  Factors tend to work best as they are split up into different levels and you can visualize the data easier this way.  A new dataset will allow me to do this without affecting my analysis dataset.  I will call this new set "sal_eda"
+
+```{r}
+sal_eda <- sal_clean
+
+factor_cols2 <- c("JobInvolvement", "JobSatisfaction", "PerformanceRating", "RelationshipSatisfaction", "WorkLifeBalance","Education", "EnvironmentSatisfaction", "JobLevel", "NumCompaniesWorked", "PercentSalaryHike",  "StockOptionLevel", "TotalWorkingYears", "TrainingTimesLastYear", "YearsAtCompany", "YearsInCurrentRole",  "YearsSinceLastPromotion", "YearsWithCurrManager")
+
+sal_eda[,factor_cols2] <- lapply(sal_eda[,factor_cols2], as.factor)
+
+skim(sal_eda)
+```
+
+In this EDA we will look at how each variable in our dataset interacts with both Employee Attrition and Monthly Income.
+
+First, lets take a look at our two variables a bit closer
+
+### Employee Attrition
+
+``` {r}
+sal_eda %>% ggplot(aes(x=Attrition,fill=Attrition)) + 
+  geom_bar()+
+  geom_text(aes(label = after_stat(count)), stat = "count", vjust = 1.5, position = position_dodge(0.9) ,colour = "black")+
+  xlab("Attrition")+ylab("Count") + 
+  ggtitle("Attrition Count")
+```
+
+We see that out of the 870 observed employees, 140 left.  This is roughly a 16% Attrition Rate.  There are also many more employees who have stayed vs those who have left, but we still want to explore why our attrition rate is so high. Typically, companies want to aim for attrition rates lower than 10%.
+
+Lets move on to the second variable: Monthly Income
+
+### Monthly Income
+
+This plot displays the distribution of monthly income across all 870 employees
+
+```{r}
+sal_eda %>% 
+  ggplot(aes(x=MonthlyIncome))+
+  geom_histogram(binwidth = 1000, color = "black", fill = "lightblue") + 
+  ggtitle("Employee Monthly Income")
+```
+
+We can clearly see the monthly income is right skewed with a majority of employees making > 8,000 a month. 
+
+Due to the wide spread of income (from 0-20,000), I want to group them into 5 groups: 0 - 3999, 4000 - 7999, 8000 - 11999, 12000 - 15999, and 16000 - <20000.  This will allow me to look at different statistics between the various income classes. 
+
+```{r}
+sal_eda$IncomeRange <- cut(sal_eda$MonthlyIncome, c(0,4000,8000,12000,16000,20000), labels = c("<4000", "4000 - 7999", "8000 - 11999", "12000 - 15999", "16000 - <20000"))
+```
+
+Lets see what our new column looks like
+
+```{r}
+sal_eda %>%
+  ggplot(aes(IncomeRange)) +
+  geom_bar(color = "black", fill = "lightblue") + 
+  ggtitle("Income Ranges of Monthly Income")
+```
+
+As we suspected, the majority of employees recorded make less than 8,000 per month.  
+
+Now lets take a look at the relationship between the two explanatory variables (Monthly Income and Attrition).  I added a reference line at 16% to show the company attrition rate
+
+```{r}
+h_line <- .16
+
+sal_eda %>%
+  ggplot(aes(x=IncomeRange,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Monthly Income") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Income Ranges of Employees") + 
+  ylab("Percentage of Employees")
+```
+
+This bar chart shows that employees making less than 4,000 per month are more likely to leave their job than any other group.  The range between 8000 - 11,999 are close to the line as well
+
+Lets dive into the HourlyRate, DailyRate, and MonthlyRate variables.  I mainly will be checking to see if they have any correlation towards both Monthly Income and Attrition Rates. 
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=HourlyRate,y= MonthlyIncome, color = Attrition)) +
+  geom_point() +
+  ggtitle("Monthly Income vs Hourly Rate") +
+  xlab("Hourly Rate") + 
+  ylab("Monthly Income")
+
+sal_eda %>%
+  ggplot(aes(x=DailyRate,y= MonthlyIncome, color = Attrition)) +
+  geom_point() +
+  ggtitle("Monthly Income vs Daily Rate") +
+  xlab("Daily Rate") + 
+  ylab("Monthly Income")
+
+sal_eda %>%
+  ggplot(aes(x=MonthlyRate,y= MonthlyIncome, color = Attrition)) +
+  geom_point() +
+  ggtitle("Monthly Income vs Monthly Rate") +
+  xlab("Monthly Rate") + 
+  ylab("Monthly Income")
+```
+
+There does not seem to be any kind of correlation between any of the three rates in association with Monthly Income nor with Attrition rate, but we can perform a better analysis before selecting the model. 
+
+Now lets take a look at each variable and any associations they might have with Monthly Income and Attrition Rate.  I will be doing Box Plots and Bar Graphs to visualize these relationships (if any). 
+
+### Age
+
+First lets take a look the Age range of all recorded employees
+
+```{r}
+sal_eda %>% 
+  ggplot(aes(x=Age))+
+  geom_histogram(binwidth = 1, color = "black", fill = "lightblue") + 
+  ggtitle("Employee Age")
+```
+
+The majority of employees are  between 34 and 35 with the youngest at 18 and the oldest at 60. Now lets look at the relationship between attrition and the income ranges:
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=Age,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Employee Age") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(16, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Employee Ages") + 
+  ylab("Percentage of Employees")
+```
+
+This bar chart shows that employees between 18 - 22 and older than 52 tend to leave their jobs more frequently while the middle group tends to stick around for a bit longer.  The older group could likely be attributed towards retirement age (65 in the US). 
+
+Just like with monthly income, I will split up the age variable into 4 different groups: 18 - 25, 25 - 35, 35 - 45, 45 - 50, >50 then explore the relationship between income and these age groups.
+
+```{r}
+range(sal_eda$Age)
+
+sal_eda$AgeRange <- cut(sal_eda$Age, c(18,25,35,45,50,60), labels = c("18 - 24", "25 - 34", "35 - 44", "45 - 50", ">50"), include.lowest = T)
+
+sal_eda %>%
+  ggplot(aes(x=AgeRange,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Employee Age") +
+  xlab("Employee Age Ranges") + 
+  ylab("Monthly Income")
+```
+
+The Age ranges with the highest income seem to be between 45 - >50.  
+
+### BusinessTravel
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=BusinessTravel,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Travel Frequncy") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0.5, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Travel Frequency") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=BusinessTravel,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Travel Frequency") +
+  xlab("Travel Frequency") + 
+  ylab("Monthly Income")
+```
+
+The employees that are on the road away from home look to have the highest attrition values; however, more travel looks to be associated with higher pay. 
+
+### Department
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=Department,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Department") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0.5, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Department") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=Department,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Department") +
+  xlab("Department") + 
+  ylab("Monthly Income")
+```
+
+Sales looks to have the highest attrition rate followed by Human Resources. Human Resources also looks to have the highest variance of salary but all three departments look to have around the same mean monthly income. 
+
+### Distance from Home
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=DistanceFromHome,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Distance From Home") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0.5, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Distance From Home") + 
+  ylab("Percentage of Employees")
+```
+
+There does not seem to be any significant relationship between how far an employees commute is vs their attrition rate
+
+### Education
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=Education,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Education") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0.5, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Education") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=Education,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Department") +
+  xlab("Education") + 
+  ylab("Monthly Income")
+```
+
+Education levels lower than 4 look to have the higher levels of attrition and an education level of 5 is associated with an overall higher salary.
+
+### Education Field
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=EducationField,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Education Field") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0.5, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Education Field") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=EducationField,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Education Field") +
+  xlab("Education Field") + 
+  ylab("Monthly Income")
+```
+
+Much like the department, employees who studied Human Resources have the highest variance of salaries compared to the other fields. They also have a higher level of attrition along with Marketing and those with technical degrees. 
+
+### Environment Satisfaction
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=EnvironmentSatisfaction,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Environment Satisfaction") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0.5, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Environment Satisfaction") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=EnvironmentSatisfaction,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Environment Satisfaction") +
+  xlab("Environment Satisfaction") + 
+  ylab("Monthly Income")
+```
+
+Employees not satisfied with their environment tend to have a higher attrition rate.
+
+### Gender
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=Gender,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Gender") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0.5, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Gender") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=Gender,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Gender") +
+  xlab("Gender") + 
+  ylab("Monthly Income")
+```
+
+Men tend to quit more (just slightly) than women, but men also have higher salaries.  Women though tend to have a higher median income range. 
+
+### Job Involvement
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=JobInvolvement,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Job Involvement") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Job Involvement") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=JobInvolvement,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Job Involvement") +
+  xlab("Job Involvement") + 
+  ylab("Monthly Income")
+```
+
+Employees that have little job involvement are associated with a higher attrition rate with the higher job involvement being associated with higher salaries.
+
+### Job Level
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=JobLevel,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Job Level") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Job Level") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=JobLevel,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Job Level") +
+  xlab("Job Level") + 
+  ylab("Monthly Income")
+```
+
+Higher job levels are associated with higher pay while lower job levels are associated with a higher attrition rate.
+
+### Job Role
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=JobRole,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Job Role") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Job Role") + 
+  ylab("Percentage of Employees")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+sal_eda %>%
+  ggplot(aes(x=JobRole,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Job Role") +
+  xlab("Job Role") + 
+  ylab("Monthly Income")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+Managers and Research Directors make the highest salaries.  The data also shows that employees in sales tend to have the highest attrition rates.
+
+### Job Satisfaction
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=JobSatisfaction,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Job Satisfaction") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Job Satisfaction") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=JobSatisfaction,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Job Satisfaction") +
+  xlab("Job Satisfaction") + 
+  ylab("Monthly Income")
+```
+
+Job satisfaction looks to have a relatively equal variance for salaries; however, lower satisfaction is associated with a higher attrition rate. 
+
+### Marital Status
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=MaritalStatus,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Marital Status") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Marital Status") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=MaritalStatus,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Marital Status") +
+  xlab("Marital Status") + 
+  ylab("Monthly Income")
+```
+
+Single employees tend to quit in higher percentages and have the lowest variance in salaries.
+
+### Number of Comapnies Worked
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=NumCompaniesWorked,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Number of Companies Worked") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Number of Companies Worked") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=NumCompaniesWorked,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Number of Companies Worked") +
+  xlab("Number of Companies Worked") + 
+  ylab("Monthly Income")
+```
+
+Employees who have hopped around more tend to have a higher attrition rate.  The salaries though are relatively equal in variance. 
+
+### Over Time
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=OverTime,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Over Time") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Over Time") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=OverTime,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Over Time") +
+  xlab("Over Time") + 
+  ylab("Monthly Income")
+```
+
+Employees with higher rates of over time are associated with higher attrition rates; however, there is no change in monthly income between employees who do and do not. 
+
+### Percent Salary Hike
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=PercentSalaryHike,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Percent Salary Hike") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Percent Salary Hike") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=PercentSalaryHike,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Percent Salary Hike") +
+  xlab("Percent Salary Hike") + 
+  ylab("Monthly Income")
+
+```
+Employees who have 22-24% Salary Hikes tend to have higher rate of attrition.  This higher percent salary hike also is associated with higher average monthly incomes.
+
+### Performance Rating
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=PerformanceRating,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Performance Rating") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Performance Rating") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=PerformanceRating,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Performance Rating") +
+  xlab("Performance Rating") + 
+  ylab("Monthly Income")
+
+```
+
+Performance rating (between a 3 and a 4) looks to have very little effect on either Attrition rate or Monthly Income
+
+### Relationship Satisfaction
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=RelationshipSatisfaction,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Relationship Satisfaction") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Relationship Satisfaction") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=RelationshipSatisfaction,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Relationship Satisfaction") +
+  xlab("Relationship Satisfaction") + 
+  ylab("Monthly Income")
+
+```
+
+Employees with a lower Relationship Status look to have a higher rate of Attrition, but no change in the mean monthly income. 
+
+### Stock Option Level
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=StockOptionLevel,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Stock Option Level") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Stock Option Level") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=StockOptionLevel,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Stock Option Level") +
+  xlab("Stock Option Level") + 
+  ylab("Monthly Income")
+
+```
+
+Employees with either 0 stock option level or the highest have the highest rates of attrition.  This could be either lower level employees for no stock option or executives closer to retirement.   But Stock option levels don't have any variance in the mean of the monthly income. 
+
+# Stock Option Levels vs Age and Income
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=AgeRange,y = MonthlyIncome, fill=StockOptionLevel))+ 
+  geom_col(position = "dodge")+
+  ggtitle("Age Ranges vs Stock Option Level") + 
+  xlab("Age Ranges") + 
+  ylab("Monthly Income")
+```
+The higher age groups tend to have the higher level of stock options vs the lower age groups
+
+### Total Working Years
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=TotalWorkingYears,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Total Working Years") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Total Working Years") + 
+  ylab("Percentage of Employees") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+sal_eda %>%
+  ggplot(aes(x=TotalWorkingYears,y= MonthlyIncome)) +
+  geom_point() + geom_smooth(method = "lm") + 
+  ggtitle("Monthly Income vs Total Working Years") +
+  xlab("Total Working Years") + 
+  ylab("Monthly Income") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+Less experienced employees are associated with a higher attrition rate.  Same goes for employees with 31+ years (due to retirement likely). Also, employees with more years of experience are also associated with higher salaries. 
+
+### Times Trained in the last year
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=TrainingTimesLastYear,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Times Trained in the last year") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Times Trained in the last year") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=TrainingTimesLastYear,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Times Trained in the last year") +
+  xlab("Times Trained in the last year") + 
+  ylab("Monthly Income")
+
+```
+
+Employees who have not been trained very much in the last year are more likely to quit over employees who have had ample training opportunities. It also shows that the more training an employee goes through, the higher their overall salaries. 
+
+### Work Life Balance
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=WorkLifeBalance,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Work Life Balance") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Work Life Balance") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=WorkLifeBalance,y= MonthlyIncome)) +
+  geom_boxplot(fill = "lightblue") +
+  stat_summary(fun=mean)  + 
+  ggtitle("Monthly Income vs Work Life Balance") +
+  xlab("Work Life Balance") + 
+  ylab("Monthly Income")
+
+```
+
+Employees with lower work/life balance have a higher chance of quitting vs employees with a better balance. 
+
+### Years at Company
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=YearsAtCompany,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Years at Company") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Years at Company") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=YearsAtCompany,y= MonthlyIncome)) +
+  geom_point() + geom_smooth(method = "lm") + 
+  ggtitle("Monthly Income vs Years at Company") +
+  xlab("Years at Company") + 
+  ylab("Monthly Income") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+Much like Total Working Years, employees who have been with the company for the shortest amount of time have a higher chance of attrition as well as employees who have been with the company the longest (retirement is likely the culprit again).  And the longer an employee is with the company, the higher their chance for a higher salary. 
+
+### Years in Current Role
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=YearsInCurrentRole,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Years in Current Role") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Years in Current Role") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=YearsInCurrentRole,y= MonthlyIncome)) +
+  geom_point() + geom_smooth(method = "lm") + 
+  ggtitle("Monthly Income vs Years in Current Role") +
+  xlab("Years in Current Role") + 
+  ylab("Monthly Income") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+It looks like only the two bookends (shortest and longest at current role) tend to have any kind of visible effect on attrition rate.  
+
+### Years since Last Promotion
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=YearsSinceLastPromotion,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Years since Last Promotion") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Years since Last Promotion") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=YearsSinceLastPromotion,y= MonthlyIncome)) +
+  geom_point() + geom_smooth(method = "lm") + 
+  ggtitle("Monthly Income vs Years since Last Promotion") +
+  xlab("Years since Last Promotion") + 
+  ylab("Monthly Income") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+The graph suggests that the longer an employee goes without a promotion, the higher chance they have to quit. 
+
+### Years with Current Manager
+
+```{r}
+sal_eda %>%
+  ggplot(aes(x=YearsWithCurrManager,fill=Attrition))+
+  geom_bar(position = "fill")+
+  ggtitle("Attrition vs Years with Current Manager") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_hline(aes(yintercept = h_line)) +
+  geom_text(aes(0, h_line, label = h_line, vjust = - 1)) + 
+  xlab("Years with Current Manager") + 
+  ylab("Percentage of Employees")
+
+sal_eda %>%
+  ggplot(aes(x=YearsWithCurrManager,y= MonthlyIncome)) +
+  geom_point() + geom_smooth(method = "lm") + 
+  ggtitle("Monthly Income vs Years with Current Manager") +
+  xlab("Years with Current Manager") + 
+  ylab("Monthly Income") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+Same with the years working and years at the current company, the employees who have been in their position the shortest and longest have the higher rates of attrition. 
+
+
+# KNN and Naive Bayes Predictions For Attrition Rate
+
+## KNN
+
+### Finding the best variables using forward, backward, and step-wise selection
+First, we can create a clean KNN dataset to use to build our 3 models off of.  This clean data set will remove any variable we cannot create in either binary or is non-numerical.  KNN uses Euclidian distances, so categorical variables that use levels will not apply, thus will be left out; however, binary can still be useful in determining the prediction. 
+```{r}
+sal_knn <- select(sal_data, -c("BusinessTravel", "Department", "EducationField", "JobRole", "MaritalStatus"))
+
+sal_knn$OverTime = ifelse(sal_knn$OverTime == "Yes", 1, 0)
+sal_knn$Attrition = ifelse(sal_knn$Attrition == "Yes", 1, 0)
+sal_knn$Gender = ifelse(sal_knn$Gender == "Male", 1, 0)
+
+# Forward Selection
+best_subset_forward <- 
+  regsubsets(Attrition~.,
+             data = sal_knn,
+             nbest = 1,
+             nvmax = NULL,
+             force.in = NULL, force.out = NULL,
+             method = "forward")
+
+# Backward Selection
+best_subset_backward <- 
+  regsubsets(Attrition~.,
+             data = sal_knn,
+             nbest = 1,
+             nvmax = NULL,
+             force.in = NULL, force.out = NULL,
+             method = "backward")
+
+# Sequential/Stepwise Selection
+best_subset_stpwse <- 
+  regsubsets(Attrition~.,
+             data = sal_knn,
+             nbest = 1,
+             nvmax = NULL,
+             force.in = NULL, force.out = NULL,
+             method = "seqrep")
+
+forward_summary <- summary(best_subset_backward)
+as.data.frame(forward_summary$outmat)
+
+backward_summary <- summary(best_subset_forward)
+as.data.frame(backward_summary$outmat)
+
+seq_summary <- summary(best_subset_stpwse)
+as.data.frame(seq_summary$outmat)
+
+which.max(forward_summary$adjr2)
+which.max(backward_summary$adjr2)
+which.max(seq_summary$adjr2)
+
+# Forward Selection Variables
+forward_summary$which[18,]
+
+# Backward Selection Variables
+backward_summary$which[18,]
+
+# Sequential Selection Variables
+seq_summary$which[18,]
+```
+
+All three selection processes produced the same results, so we will just need to build 1 model with the selection!  It's interesting to see that the EDA assesment aggrees that DailyRate and MonthlyRate don't have any association with Attrition, but HourlyRate does. 
+
+### Build KNN Model Based on the selection process
+
+We can build our model using the 18 parameters we pulled from our three selection processes:
+
+Age, DistanceFromHome, EnvironmentSatisfaction, HourlyRate, JobInvolvement, JobLevel, JobSatisfaction, NumCompaniesWorked, OverTime, RelationshipSatisfaction, StockOptionLevel, TotalWorkingYears, TrainingTimesLastYear, WorkLifeBalance, YearsAtCompany, YearsInCurrentRole, YearsSinceLastPromotion, and YearsWithCurrManager. 
+
+In addition, I will also be oversampling using an Adaptive Synthetic (ADASYN) algorithm to help with the imbalanced dataset between yes and no. 
+
+```{r}
+knn_model = select(sal_data, "Attrition", "Age", "DistanceFromHome",  "EnvironmentSatisfaction",  "HourlyRate",  "JobInvolvement", "JobLevel", "JobSatisfaction", "NumCompaniesWorked","OverTime", "RelationshipSatisfaction","StockOptionLevel", "TotalWorkingYears", "TrainingTimesLastYear", "WorkLifeBalance", "YearsAtCompany", "YearsInCurrentRole","YearsSinceLastPromotion", "YearsWithCurrManager")
+
+knn_model$OverTime = ifelse(knn_model$OverTime == "Yes", 1, 0)
+knn_model$Attrition = ifelse(knn_model$Attrition == "Yes", 1, 0)
+
+knn_model = oversample(knn_model, classAttr = "Attrition", method = "ADASYN")
+
+set.seed(321)
+splitPercKnn = 0.8
+trainIndicesKnn = sample(1:dim(knn_model)[1],round(splitPercKnn * dim(knn_model)[1]))
+trainKnn = knn_model[trainIndicesKnn,]
+testKnn = knn_model[-trainIndicesKnn,]
+classification <- knn(trainKnn, testKnn, trainKnn$Attrition, k=3)
+CM_Knn = confusionMatrix(classification, as.factor(testKnn$Attrition))
+CM_Knn
+SensKnn = CM_Knn$byClass['Sensitivity']
+SpecKnn = CM_Knn$byClass['Specificity']
+AccKnn = CM_Knn$overall['Accuracy']
+SensKnn
+SpecKnn
+AccKnn
+```
+
+## Niave Bayes
+
+Now we will perform the same steps as above, but this time with a Naive Bayes model.  We can include more variables as they do not require only numeric values. 
+
+Just like with KNN, we will create a new dataset to work with. 
+
+```{r}
+sal_NB <- sal_data
+
+# Forward Selection
+best_subset_forward <- 
+  regsubsets(Attrition~.,
+             data = sal_NB,
+             nvmax = NULL,
+             method = "forward")
+
+# Backward Selection
+best_subset_backward <- 
+  regsubsets(Attrition~.,
+             data = sal_NB,
+             nvmax = NULL,
+             method = "backward")
+
+# Sequential/Stepwise Selection
+best_subset_stpwse <- 
+  regsubsets(Attrition~.,
+             data = sal_NB,
+             nvmax = NULL,
+             method = "seqrep")
+
+forward_summary <- summary(best_subset_backward)
+as.data.frame(forward_summary$outmat)
+
+backward_summary <- summary(best_subset_forward)
+as.data.frame(backward_summary$outmat)
+
+seq_summary <- summary(best_subset_stpwse)
+as.data.frame(seq_summary$outmat)
+
+which.max(forward_summary$adjr2)
+which.max(backward_summary$adjr2)
+which.max(seq_summary$adjr2)
+
+# Forward Selection Variables
+forward_summary$which[29,]
+
+# Backward Selection Variables
+backward_summary$which[28,]
+
+# Sequential Selection Variables
+seq_summary$which[27,]
+```
+
+Forward selection chose 29 variables, Backward selection chose 28, and Sequential chose 27.  We will build three models using these methods to see which is the best fit
+
+```{r}
+NB_FWD <- select(sal_NB, -c("DailyRate", "Department", "Education", "JobLevel", "JobRole", "MonthlyIncome", "MonthlyRate", "PercentSalaryHike", "PerformanceRating", "StockOptionLevel"))
+
+NB_BWD <- select(sal_NB, -c("DailyRate", "Education", "JobLevel", "JobRole", "MonthlyIncome", "MonthlyRate", "PercentSalaryHike", "PerformanceRating", "StockOptionLevel"))
+
+NB_SEQ <- select(sal_NB, -c("DailyRate", "Education", "JobLevel","MonthlyIncome", "MonthlyRate", "PercentSalaryHike", "PerformanceRating", "StockOptionLevel"))
+set.seed(1234)
+splitPercNB = 0.8
+trainIndicesNB_FWD = sample(1:dim(NB_FWD)[1],round(splitPercNB * dim(NB_FWD)[1]))
+trainIndicesNB_BWD = sample(1:dim(NB_BWD)[1],round(splitPercNB * dim(NB_BWD)[1]))
+trainIndicesNB_SEQ = sample(1:dim(NB_SEQ)[1],round(splitPercNB * dim(NB_SEQ)[1]))
+trainNB_FWD = NB_FWD[trainIndicesNB_FWD,]
+testNB_FWD = NB_FWD[-trainIndicesNB_FWD,]
+trainNB_BWD = NB_BWD[trainIndicesNB_BWD,]
+testNB_BWD = NB_BWD[-trainIndicesNB_BWD,]
+trainNB_SEQ = NB_SEQ[trainIndicesNB_SEQ,]
+testNB_SEQ = NB_SEQ[-trainIndicesNB_SEQ,]
+NB1 <- naiveBayes(Attrition~.,data = trainNB_FWD,laplace = -1)
+NB2 <- naiveBayes(Attrition~.,data = trainNB_BWD,laplace = -1)
+NB3 <- naiveBayes(Attrition~.,data = trainNB_SEQ,laplace = -1)
+predNB1 = predict(NB1, testNB_FWD)
+predNB2 = predict(NB2, testNB_BWD)
+predNB3 = predict(NB3, testNB_SEQ)
+table(as.factor(testNB_FWD$Attrition),predNB1)
+table(as.factor(testNB_BWD$Attrition),predNB2)
+table(as.factor(testNB_SEQ$Attrition),predNB3)
+#Confusion Matrix
+CM_FWD = confusionMatrix(predNB1,as.factor(testNB_FWD$Attrition))
+CM_BWD = confusionMatrix(predNB2,as.factor(testNB_BWD$Attrition))
+CM_SEQ = confusionMatrix(predNB3,as.factor(testNB_SEQ$Attrition))
+CM_FWD
+CM_BWD
+CM_SEQ
+
+# Sensitivities
+Sens_FWD = CM_FWD$byClass['Sensitivity']
+Sens_BWD = CM_BWD$byClass['Sensitivity']
+Sens_SEQ = CM_SEQ$byClass['Sensitivity']
+
+Sens_FWD
+Sens_BWD
+Sens_SEQ
+
+# Specificities
+Spec_FWD = CM_FWD$byClass['Specificity']
+Spec_BWD = CM_BWD$byClass['Specificity']
+Spec_SEQ = CM_SEQ$byClass['Specificity']
+
+Spec_FWD
+Spec_BWD
+Spec_SEQ
+
+# Accuracies
+Acc_FWD = CM_FWD$overall['Accuracy']
+Acc_BWD = CM_BWD$overall['Accuracy']
+Acc_SEQ = CM_SEQ$overall['Accuracy']
+
+Acc_FWD
+Acc_BWD
+Acc_SEQ
+
+```
+
+The forward model looks to be the strongest fit with the best accuracy, specificity, and sensitivity.  I will take this and further refine it.  Using the parameter selection method and also looking at the EDA visualizations
+
+```{r}
+NB_Best <- select(sal_NB, -c("DailyRate", "Education", "MonthlyRate", "PercentSalaryHike", "PerformanceRating", "StockOptionLevel"))
+set.seed(321)
+splitPercNB1 = 0.8
+trainIndicesNB_Best = sample(1:dim(NB_Best)[1],round(splitPercNB1 * dim(NB_Best)[1]))
+trainNB_Best = NB_Best[trainIndicesNB_Best,]
+testNB_Best = NB_Best[-trainIndicesNB_Best,]
+NB_Final <- naiveBayes(Attrition~.,data = trainNB_Best,laplace = -1)
+predNB_Final = predict(NB_Final, testNB_Best)
+table(as.factor(testNB_Best$Attrition),predNB_Final)
+#Confusion Matrix
+CM_Best = confusionMatrix(predNB_Final,as.factor(testNB_Best$Attrition))
+CM_Best
+
+# Sensitivity
+Sens = CM_Best$byClass['Sensitivity']
+Sens
+
+# Specificity
+Spec = CM_Best$byClass['Specificity']
+Spec
+
+# Accuracy
+Acc = CM_Best$overall['Accuracy']
+Acc
+```
+
+Final results for KNN vs NB:
+
+# KNN
+
+Accuracy -    81.82%
+Sensitivity - 65.47%
+Specificity - 97.28%
+
+# NB
+
+Accuracy -    85.05%
+Sensitivity - 89.51%
+Specificity - 64.52%
+
+NB model has the better overall accuracy and sensitivity + specificty score, so we will use our Naive Bayes model in our prediction fit. 
+
+### Build prediction model with the no_attrition data set
+```{r}
+
+PredictedAttrition <- predict(NB_Final, no_attrition)
+
+no_attrition$PredictedAttrition <- PredictedAttrition
+
+Competition_Attrition = no_attrition %>% select(ID, PredictedAttrition) %>% arrange(ID)
+
+write.csv(Competition_Attrition, "/Users/rober/OneDrive/Desktop/MSDS 6306/Employee-Attrition-Project/Case2PredictionsBlue_Attrition.csv")
+
+```
+
+### Linear Regression Model for Income Prediction
+
+Just like with the Attrition Models, we will use forward, backward, and stepwise selection to see which variables fit best with our model. This time, we will be using the OLSRR package to do our variable selection. We determined that the hourly, daily, and monthly rates don't play into the monthly income, so we can eliminate those off the bat. 
+
+## Selection Process
+
+``` {r}
+sal_LM <- select(sal_data, -c("HourlyRate", "DailyRate", "MonthlyRate"))
+
+model <- lm(MonthlyIncome ~., data = sal_LM)
+LM_Step <- ols_step_both_aic(model)
+LM_FWD <- ols_step_forward_aic(model)
+LM_BWD <- ols_step_backward_aic(model)
+
+# Step-Wise Results
+
+LM_Step$predictors
+
+# Forward Results
+
+LM_FWD$predictors
+
+# Backward Results
+
+LM_BWD$predictors
+
+```
+
+Forward and Stepwise both produced 8 variables where Backward produced 17.  We will proceed with creating two models to see which results in the best RMSE. 
+
+### Build the linear regression model
+
+```{r}
+set.seed(321)
+sal_LM1 <- select(sal_data, "MonthlyIncome", "JobLevel", "JobRole", "TotalWorkingYears", "BusinessTravel", "Gender", "YearsWithCurrManager", "YearsSinceLastPromotion", "DistanceFromHome")
+sal_LM2 <- select(sal_data, "MonthlyIncome","EducationField", "MaritalStatus", "Age", "OverTime", "StockOptionLevel", "YearsAtCompany", "EnvironmentSatisfaction", "YearsInCurrentRole", "RelationshipSatisfaction", "NumCompaniesWorked", "JobInvolvement", "TrainingTimesLastYear", "Attrition", "JobSatisfaction", "WorkLifeBalance", "Department", "Education")
+
+splitPerc = 0.8
+trainIndices1 = sample(1:dim(sal_LM1)[1],round(splitPerc * dim(sal_LM1)[1]))
+trainIndices2 = sample(1:dim(sal_LM2)[1],round(splitPerc * dim(sal_LM2)[1]))
+train1 = sal_LM1[trainIndices1,]
+train2 = sal_LM2[trainIndices2,]
+test1 = sal_LM1[-trainIndices1,]
+test2 = sal_LM2[-trainIndices2,]
+lm1 = lm(MonthlyIncome ~ ., data = train1)
+lm2 = lm(MonthlyIncome ~ ., data = train2)
+summary(lm1)
+summary(lm2)
+pred1 = predict(lm1, test1)
+pred2 = predict(lm2, test2)
+RMSE1 = sqrt(mean((test1$MonthlyIncome - pred1)^2))
+RMSE2 = sqrt(mean((test2$MonthlyIncome - pred2)^2))
+RMSE1
+RMSE2
+```
+
+Our first linear regression model has the smallest RMSE so we will choose this one for our prediction!
+
+### Build prediction model with the no_salary data set
+```{r}
+PredictedIncome <- predict(lm1, no_salary)
+
+no_salary$PredictedIncome = PredictedIncome
+
+Competition_Income <- no_salary %>% select(ID, PredictedIncome) %>% arrange(ID)
+
+write.csv(Competition_Income, "/Users/rober/OneDrive/Desktop/MSDS 6306/Employee-Attrition-Project/Case2PredictionsBlue_Income.csv")
+```
+
+
+# Conclusion
+
+The evidence suggests that employee attrition is associated with several factors both internal and external.  The internal factors that the company can immediately start working on to reduce attrition are environmental satisfaction, distance from home (by offering more remote work), reduce the amount of traveling needed for business, and job involvement.  There are other outside factors that the company has very little control over such as the gender and marital status of the employee or their job role. 
+
+Monthly salary can be predicted based on a few variables that are expected such as years of experience, the role and level of the job being analyzed, the measure of time since an employee's last promotion, and how far an employee has to travel from home. 
