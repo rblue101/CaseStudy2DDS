@@ -15,3 +15,7 @@ Within this repo, you will find the markdown file and HTML file that includes al
 ## RShiny App
 
 https://rblue101.shinyapps.io/Attrition_Income/
+
+## YouTube Presentation of Data and Analysis 
+
+https://www.youtube.com/watch?v=GUGeStTsiS8
